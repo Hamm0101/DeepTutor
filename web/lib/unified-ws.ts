@@ -40,6 +40,10 @@ export interface StreamEvent {
   turn_id?: string;
   seq?: number;
   timestamp: number;
+  /** Set by the backend when ``content`` was capped to fit a per-type limit.
+   *  The UI should show a "[truncated]" hint so the user knows the full
+   *  payload is not on the wire. */
+  _truncated?: boolean;
 }
 
 export interface LLMSelection {

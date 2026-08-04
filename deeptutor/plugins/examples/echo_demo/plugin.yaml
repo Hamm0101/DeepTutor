@@ -1,0 +1,18 @@
+# Example: "echo" tool plugin.
+#
+# This is the smallest possible tool plugin: a directory with plugin.yaml +
+# tool.py. Copy this directory into your plugins root (default
+# `data/workspace/plugins`, or the path in `$DEEPTUTOR_PLUGINS_DIR`) and
+# restart — the `echo_demo` tool becomes callable by the chat agent and
+# shows up in `/api/v1/plugins/list`.
+#
+# A tool plugin exports a `Tool` class (a BaseTool subclass) OR a `TOOLS`
+# list of BaseTool subclasses/instances. See
+# `deeptutor/plugins/loader.py:load_plugin_tools` for the full contract.
+
+name: echo_demo
+type: tool
+entry: tool.py
+description: Echoes its input back with a prefix. Demo plugin.
+version: 0.1.0
+author: DeepTutor custom

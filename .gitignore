@@ -128,6 +128,14 @@ cache/
 
 # Log files
 *.log
+*.err
+
+# Runtime launch/log files produced by dev startup scripts
+deeptutor-start.log
+deeptutor-start.log.err
+deeptutor-backend.log
+deeptutor-backend.err
+deeptutor-frontend.log
 
 # ============================================
 # IDE and Editors

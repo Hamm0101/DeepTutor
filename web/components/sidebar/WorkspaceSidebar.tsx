@@ -28,13 +28,19 @@ export default function WorkspaceSidebar() {
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
   const hasLoadedSessionsRef = useRef(false);
+  // Debounce rapid sidebar refresh triggers (STREAM_END + SET_SESSION_TITLE
+  // fire back-to-back each turn). Without this, ``force: true`` bypasses the
+  // 15s client cache and hits the server twice per turn. A 2s debounce lets
+  // both signals coalesce into one cache-bypassing fetch, and the TTL cache
+  // handles intermediate refresh-token bumps silently.
+  const pendingRefreshRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshSessions = useCallback(async () => {
     if (!hasLoadedSessionsRef.current) {
       setLoadingSessions(true);
     }
     try {
-      setSessions(await listSessions(50, 0, { force: true }));
+      setSessions(await listSessions(50, 0, {}));
       hasLoadedSessionsRef.current = true;
     } catch (error) {
       console.error("Failed to load sessions", error);
@@ -45,11 +51,30 @@ export default function WorkspaceSidebar() {
 
   // First mount shows the skeleton; subsequent refreshes triggered by
   // ``sidebarRefreshToken`` (STREAM_END, server-side session bind,
-  // turn deletion) silently swap in the new list. Resetting the ref
-  // each refresh briefly re-renders the loading skeleton, which the
-  // user perceives as a flicker on every message send / Answer Now.
+  // turn deletion) silently swap in the new list. The token can fire
+  // multiple times in quick succession (e.g. STREAM_END immediately
+  // followed by SET_SESSION_TITLE), so we debounce to avoid duplicate
+  // fetches. The 15s TTL inside ``listSessions`` handles the common case
+  // where the list hasn't actually changed.
   useEffect(() => {
-    void refreshSessions();
+    // First load is immediate; subsequent triggers go through the debounce.
+    if (!hasLoadedSessionsRef.current) {
+      void refreshSessions();
+      return;
+    }
+    if (pendingRefreshRef.current) {
+      clearTimeout(pendingRefreshRef.current);
+    }
+    pendingRefreshRef.current = setTimeout(() => {
+      pendingRefreshRef.current = null;
+      void refreshSessions();
+    }, 2000);
+    return () => {
+      if (pendingRefreshRef.current) {
+        clearTimeout(pendingRefreshRef.current);
+        pendingRefreshRef.current = null;
+      }
+    };
   }, [refreshSessions, sidebarRefreshToken]);
 
   const orderedSessions = sessions

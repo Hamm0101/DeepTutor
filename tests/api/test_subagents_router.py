@@ -113,7 +113,8 @@ def test_connect_list_and_disconnect_roundtrip(client):
     assert len(listed) == 1
     assert listed[0]["name"] == "MyClaude"
     assert listed[0]["agent_kind"] == "claude_code"
-    assert listed[0]["cwd"] == "/tmp"
+    # Paths are normalized per-platform ("/tmp" becomes "\\tmp" on Windows).
+    assert Path(listed[0]["cwd"]) == Path("/tmp")
 
     gone = client.delete("/api/v1/subagents/connections/MyClaude")
     assert gone.status_code == 200

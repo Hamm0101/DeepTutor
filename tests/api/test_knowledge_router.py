@@ -59,6 +59,36 @@ class _FakeKBManager:
         names = self.list_knowledge_bases()
         return names[0] if names else None
 
+    def get_info(self, name: str | None = None) -> dict:
+        """Mirror the real manager: a KB without its raw dir is treated as
+        broken, so ``get_info`` raises and the router emits a fallback row."""
+        kb_name = name or self.get_default()
+        kb_dir = self.base_dir / kb_name
+        if not (kb_dir / "raw").exists():
+            raise FileNotFoundError(f"Knowledge base '{kb_name}' is not initialized")
+        kb_config = self.config.get("knowledge_bases", {}).get(kb_name, {})
+        return {
+            "name": kb_name,
+            "is_default": kb_name == self.get_default(),
+            "statistics": {},
+            "metadata": {"name": kb_name},
+            "path": str(kb_dir),
+            "status": kb_config.get("status", "ready"),
+            "progress": kb_config.get("progress"),
+        }
+
+    def get_info_batch(self, names: list[str]) -> dict[str, dict]:
+        """Batched ``get_info`` — per-KB failures are skipped so the caller
+        can build fallback rows (mirrors the real manager)."""
+        self.config = self._load_config()
+        results: dict[str, dict] = {}
+        for name in names:
+            try:
+                results[name] = self.get_info(name)
+            except Exception:
+                continue
+        return results
+
     def get_knowledge_base_path(self, name: str) -> Path:
         kb_dir = self.base_dir / name
         kb_dir.mkdir(parents=True, exist_ok=True)
@@ -502,7 +532,7 @@ def test_list_fallback_reports_error_status(monkeypatch, tmp_path: Path) -> None
     [item] = response.json()
     assert item["status"] == "error"
     assert item["progress"]["stage"] == "error"
-    assert "get_info" in item["progress"]["error"]
+    assert "Failed to load info for KB 'broken-kb'" in item["progress"]["error"]
 
 
 def _ready_kb_manager(tmp_path: Path, name: str = "kb") -> "_FakeKBManager":

@@ -1304,6 +1304,28 @@ class KnowledgeBaseManager:
 
         return info
 
+    def get_info_batch(self, names: list[str]) -> dict[str, dict]:
+        """Batched ``get_info`` — one config load, one result per name.
+
+        Returns ``{name: info_dict}`` for names that loaded successfully.
+        Names that raised are omitted from the result (caller can detect
+        missing keys and build fallback rows, as ``list_knowledge_bases``
+        already does per-KB). Loading config once instead of N times is the
+        main win; the per-KB disk probing (``inspect_kb_versions`` etc.) is
+        still per-KB work but happens outside any shared lock.
+        """
+        # Single config load for the whole batch.
+        self.config = self._load_config()
+        results: dict[str, dict] = {}
+        for name in names:
+            try:
+                results[name] = self.get_info(name)
+            except Exception:
+                # Per-KB failures are expected (corrupt config, missing dir,
+                # provider probe error). Caller handles the missing entry.
+                continue
+        return results
+
     def delete_knowledge_base(self, name: str, confirm: bool = False) -> bool:
         """
         Delete a knowledge base

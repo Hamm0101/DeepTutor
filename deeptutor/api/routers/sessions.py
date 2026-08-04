@@ -87,45 +87,73 @@ async def list_sessions(
     return {"sessions": sessions}
 
 
-# Cap (in characters) for a single event payload returned to the UI. RAG
-# tools can attach whole KB documents to ``tool_result``/``observation``
-# events; the frontend TraceSurface only needs a preview, and the LLM context
-# is built from a separate content-only store, so capping here never affects
-# model input.
-MAX_EVENT_PAYLOAD = 1024 * 1024
+# Per-type payload caps (in characters) for events returned to the UI.
+#
+# ``tool_result``/``observation`` events can embed whole KB documents or
+# full web pages; ``thinking`` stream-chunks from reasoning models can also
+# run very large. The frontend only needs a preview for rendering — the LLM
+# context is assembled from a separate content-only store, so capping here
+# never affects model input. Keep ``head`` semantics for tool results (the
+# beginning is usually the most informative), ``tail`` for thinking (the
+# latest chain-of-thought is what the user wants to see).
+MAX_TOOL_RESULT_PAYLOAD = 50_000
+MAX_THINKING_PAYLOAD = 20_000
+MAX_ATTACHMENT_EXTRACTED_TEXT = 50_000
 _TRUNCATION_NOTICE = "\n\n[... content truncated]"
-_TRUNCATABLE_EVENT_TYPES = ("tool_result", "observation")
+_TRUNCATABLE_EVENT_TYPES = ("tool_result", "observation", "thinking")
 
 
-def _truncate_oversized_events(
-    messages: list[dict[str, Any]], limit: int = MAX_EVENT_PAYLOAD
-) -> None:
-    """Cap oversized ``tool_result``/``observation`` payloads in place.
+def _truncate_oversized_events(messages: list[dict[str, Any]]) -> None:
+    """Cap oversized event payloads + attachment ``extracted_text`` in place.
 
     The session store already returns each message's events as a parsed
     ``events`` list (see ``SqliteSessionStore._serialize_message``), so we
     mutate that list directly. Only the UI rendering path is affected.
+    Per-type limits keep the most informative slice:
+      * ``tool_result``/``observation`` → head (start of the payload)
+      * ``thinking`` → tail (most recent chain-of-thought)
     """
 
-    def _cap(container: dict[str, Any], field: str) -> bool:
+    def _cap_head(container: dict[str, Any], field: str, limit: int) -> bool:
         value = container.get(field)
         if isinstance(value, str) and len(value) > limit:
             container[field] = value[:limit] + _TRUNCATION_NOTICE
             return True
         return False
 
+    def _cap_tail(container: dict[str, Any], field: str, limit: int) -> bool:
+        value = container.get(field)
+        if isinstance(value, str) and len(value) > limit:
+            container[field] = _TRUNCATION_NOTICE + value[-limit:]
+            return True
+        return False
+
     for msg in messages:
+        # Truncate oversized ``extracted_text`` inside attachments — a single
+        # PDF can dump its full text here, and the chat UI never needs more
+        # than a preview for the attachment chip.
+        attachments = msg.get("attachments")
+        if isinstance(attachments, list):
+            for att in attachments:
+                if isinstance(att, dict):
+                    _cap_head(att, "extracted_text", MAX_ATTACHMENT_EXTRACTED_TEXT)
+
         events = msg.get("events")
         if not isinstance(events, list):
             continue
         for event in events:
             if not isinstance(event, dict) or event.get("type") not in _TRUNCATABLE_EVENT_TYPES:
                 continue
-            truncated = _cap(event, "content")
-            tool_metadata = (event.get("metadata") or {}).get("tool_metadata")
-            if isinstance(tool_metadata, dict):
-                for field in ("content", "answer"):
-                    truncated = _cap(tool_metadata, field) or truncated
+            event_type = event.get("type")
+            truncated = False
+            if event_type in ("tool_result", "observation"):
+                truncated = _cap_head(event, "content", MAX_TOOL_RESULT_PAYLOAD)
+                tool_metadata = (event.get("metadata") or {}).get("tool_metadata")
+                if isinstance(tool_metadata, dict):
+                    for field in ("content", "answer"):
+                        truncated = _cap_head(tool_metadata, field, MAX_TOOL_RESULT_PAYLOAD) or truncated
+            elif event_type == "thinking":
+                truncated = _cap_tail(event, "content", MAX_THINKING_PAYLOAD)
             if truncated:
                 event["_truncated"] = True
 

@@ -58,6 +58,48 @@ class ToolRegistry:
                 continue
             self.register(tool)
 
+    def load_plugins(self) -> None:
+        """Discover and register external tool plugins.
+
+        Plugin tools are loaded after built-ins and never overwrite an
+        existing registration — a plugin that reuses a built-in tool name is
+        skipped (with a warning) rather than shadowing it. This keeps the
+        built-in contract stable while still letting plugins add *new*
+        capabilities. Failures in any single plugin are logged and skipped.
+        """
+        try:
+            from deeptutor.plugins.loader import discover_plugins, load_plugin_tools
+        except Exception:
+            logger.debug("Plugin loader unavailable; skipping tool plugin discovery.", exc_info=True)
+            return
+
+        try:
+            manifests = discover_plugins()
+        except Exception:
+            logger.warning("Tool plugin discovery failed.", exc_info=True)
+            return
+
+        for manifest in manifests:
+            # The capability registry filters tool plugins by entry suffix;
+            # mirror that here so a single discovery pass serves both.
+            if manifest.type != "tool":
+                continue
+            try:
+                tools = load_plugin_tools(manifest)
+            except Exception:
+                logger.warning("Failed to load tool plugin %s", manifest.name, exc_info=True)
+                continue
+            for tool in tools:
+                if tool.name in self._tools:
+                    logger.warning(
+                        "Tool plugin %s: name %r collides with an existing tool; skipped.",
+                        manifest.name,
+                        tool.name,
+                    )
+                    continue
+                self.register(tool)
+                logger.info("Loaded tool plugin: %s (%s)", manifest.name, tool.name)
+
     def _resolve_request(
         self,
         name: str,
@@ -145,9 +187,10 @@ _default_registry: ToolRegistry | None = None
 
 
 def get_tool_registry() -> ToolRegistry:
-    """Return the global ToolRegistry (creating & loading builtins on first call)."""
+    """Return the global ToolRegistry (creating & loading builtins + plugins on first call)."""
     global _default_registry
     if _default_registry is None:
         _default_registry = ToolRegistry()
         _default_registry.load_builtins()
+        _default_registry.load_plugins()
     return _default_registry

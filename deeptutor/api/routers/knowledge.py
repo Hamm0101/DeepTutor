@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import shutil
 import traceback
+from typing import Any
 from uuid import uuid4
 
 from fastapi import (
@@ -1740,23 +1741,51 @@ async def connect_ima_route(payload: ConnectImaRequest):
 
 @router.get("/list", response_model=list[KnowledgeBaseInfo])
 async def list_knowledge_bases():
-    """List all available knowledge bases with their details."""
+    """List all available knowledge bases with their details.
+
+    The route body does heavy synchronous work — config loads, filesystem
+    probes, provider version scans — for every KB the user can see. Running
+    that inline in the event loop stalls all other WebSocket/HTTP traffic
+    for the duration, so the entire blocking body is offloaded to a worker
+    thread via ``asyncio.to_thread`` (which copies the current context, so
+    ``get_current_user`` still resolves correctly inside the thread).
+    """
     try:
-        manager = get_kb_manager()
-        kb_names = manager.list_knowledge_bases()
-        access_items = list_visible_kb_access()
-        access_by_id = {str(item.get("id") or ""): item for item in access_items}
-        own_prefix = "admin:kb:" if get_current_user().is_admin else "user:kb:"
+        return await asyncio.to_thread(_list_knowledge_bases_blocking)
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Error listing knowledge bases: {e}"
+        logger.error(f"{error_msg}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to list knowledge bases: {e!s}")
 
-        logger.debug(f"Found {len(kb_names)} knowledge bases: {kb_names}")
 
-        result = []
-        errors = []
+def _list_knowledge_bases_blocking() -> list[KnowledgeBaseInfo]:
+    """Synchronous KB-listing body — runs inside a worker thread.
 
-        for name in kb_names:
+    Uses ``get_info_batch`` so the per-KB ``_load_config`` only fires once
+    per manager instead of once per KB. Per-KB errors still produce fallback
+    rows so the UI can surface broken KBs instead of hiding them.
+    """
+    manager = get_kb_manager()
+    kb_names = manager.list_knowledge_bases()
+    access_items = list_visible_kb_access()
+    access_by_id = {str(item.get("id") or ""): item for item in access_items}
+    user = get_current_user()
+    own_prefix = "admin:kb:" if user.is_admin else "user:kb:"
+
+    logger.debug(f"Found {len(kb_names)} knowledge bases: {kb_names}")
+
+    # Batched info load — one config read per manager instead of N.
+    own_infos = manager.get_info_batch(kb_names)
+
+    result: list[KnowledgeBaseInfo] = []
+    errors: list[str] = []
+
+    for name in kb_names:
+        info = own_infos.get(name)
+        if info is not None:
             try:
-                info = manager.get_info(name)
-                logger.debug(f"Successfully got info for KB '{name}': {info.get('statistics', {})}")
                 result.append(
                     KnowledgeBaseInfo(
                         id=f"{own_prefix}{info['name']}",
@@ -1767,7 +1796,7 @@ async def list_knowledge_bases():
                         path=info.get("path"),
                         status=info.get("status"),
                         progress=info.get("progress"),
-                        source="admin" if get_current_user().is_admin else "user",
+                        source="admin" if user.is_admin else "user",
                         assigned=False,
                         read_only=False,
                         provenance_label=access_by_id.get(f"{own_prefix}{info['name']}", {}).get(
@@ -1776,122 +1805,140 @@ async def list_knowledge_bases():
                     )
                 )
             except Exception as e:
-                error_msg = f"Error getting info for KB '{name}': {e}"
+                error_msg = f"Error building info for KB '{name}': {e}"
                 errors.append(error_msg)
-                logger.warning(f"{error_msg}\n{traceback.format_exc()}")
-                try:
-                    kb_dir = manager.base_dir / name
-                    if kb_dir.exists():
-                        logger.debug(f"KB '{name}' directory exists, creating error fallback info")
-                        fallback_progress = {
-                            "stage": "error",
-                            "message": "Failed to load knowledge base info.",
-                            "error": error_msg,
-                        }
+                logger.warning(error_msg)
+        else:
+            # get_info failed inside the batch — build a fallback row.
+            error_msg = f"Failed to load info for KB '{name}'"
+            errors.append(error_msg)
+            logger.warning(f"{error_msg}")
+            try:
+                kb_dir = manager.base_dir / name
+                if kb_dir.exists():
+                    logger.debug(f"KB '{name}' directory exists, creating error fallback info")
+                    fallback_progress = {
+                        "stage": "error",
+                        "message": "Failed to load knowledge base info.",
+                        "error": error_msg,
+                    }
+                    result.append(
+                        KnowledgeBaseInfo(
+                            id=f"{own_prefix}{name}",
+                            name=name,
+                            is_default=name == manager.get_default(),
+                            statistics={
+                                "raw_documents": 0,
+                                "images": 0,
+                                "content_lists": 0,
+                                "rag_initialized": False,
+                            },
+                            metadata={"name": name, "last_error": error_msg},
+                            path=str(kb_dir),
+                            status="error",
+                            progress=fallback_progress,
+                            source="admin" if user.is_admin else "user",
+                        )
+                    )
+            except Exception as fallback_err:
+                logger.error(f"Fallback also failed for KB '{name}': {fallback_err}")
+
+    if errors and not result:
+        error_detail = f"Failed to load knowledge bases. Errors: {'; '.join(errors)}"
+        logger.error(error_detail)
+        raise HTTPException(status_code=500, detail=error_detail)
+
+    if errors:
+        logger.warning(
+            f"Some KBs had errors, returning {len(result)} results. Errors: {errors}"
+        )
+
+    logger.debug(f"Returning {len(result)} knowledge bases")
+    if not user.is_admin:
+        own_ids = {item.id for item in result}
+        # Batch the assigned-KB info loads too, grouped by manager.
+        assigned_to_load: list[tuple[Any, str, str, dict]] = []  # (manager, name, resource_id, access)
+        for access in access_items:
+            if access.get("source") != "admin" or access.get("id") in own_ids:
+                continue
+            if not access.get("available", True):
+                result.append(
+                    KnowledgeBaseInfo(
+                        id=str(access.get("id") or ""),
+                        name=str(access.get("name") or ""),
+                        is_default=False,
+                        statistics={},
+                        metadata={},
+                        path=None,
+                        status="unavailable",
+                        progress=None,
+                        source="admin",
+                        assigned=True,
+                        read_only=True,
+                        provenance_label=str(access.get("provenance_label") or ""),
+                        available=False,
+                    )
+                )
+                continue
+            resource = resolve_kb(str(access.get("id") or access.get("name") or ""))
+            assigned_manager = manager_for_resource(resource)
+            assigned_to_load.append((assigned_manager, resource.name, resource.id, access))
+
+        # Group by manager so each manager loads config once.
+        from collections import defaultdict
+
+        by_manager: dict[Any, list[tuple[str, str, dict]]] = defaultdict(list)
+        for mgr, name, rid, access in assigned_to_load:
+            by_manager[mgr].append((name, rid, access))
+
+        for mgr, entries in by_manager.items():
+            names = [e[0] for e in entries]
+            infos = mgr.get_info_batch(names)
+            for name, rid, access in entries:
+                info = infos.get(name)
+                if info is not None:
+                    try:
                         result.append(
                             KnowledgeBaseInfo(
-                                id=f"{own_prefix}{name}",
-                                name=name,
-                                is_default=name == manager.get_default(),
-                                statistics={
-                                    "raw_documents": 0,
-                                    "images": 0,
-                                    "content_lists": 0,
-                                    "rag_initialized": False,
-                                },
-                                metadata={"name": name, "last_error": error_msg},
-                                path=str(kb_dir),
-                                status="error",
-                                progress=fallback_progress,
-                                source="admin" if get_current_user().is_admin else "user",
+                                id=rid,
+                                name=info["name"],
+                                is_default=False,
+                                statistics=info.get("statistics", {}),
+                                metadata=info.get("metadata"),
+                                path=None,
+                                status=info.get("status"),
+                                progress=info.get("progress"),
+                                source="admin",
+                                assigned=True,
+                                read_only=True,
+                                provenance_label=str(access.get("provenance_label") or ""),
                             )
                         )
-                except Exception as fallback_err:
-                    logger.error(f"Fallback also failed for KB '{name}': {fallback_err}")
-
-        if errors and not result:
-            error_detail = f"Failed to load knowledge bases. Errors: {'; '.join(errors)}"
-            logger.error(error_detail)
-            raise HTTPException(status_code=500, detail=error_detail)
-
-        if errors:
-            logger.warning(
-                f"Some KBs had errors, returning {len(result)} results. Errors: {errors}"
-            )
-
-        logger.debug(f"Returning {len(result)} knowledge bases")
-        if not get_current_user().is_admin:
-            own_ids = {item.id for item in result}
-            for access in access_items:
-                if access.get("source") != "admin" or access.get("id") in own_ids:
-                    continue
-                if not access.get("available", True):
-                    result.append(
-                        KnowledgeBaseInfo(
-                            id=str(access.get("id") or ""),
-                            name=str(access.get("name") or ""),
-                            is_default=False,
-                            statistics={},
-                            metadata={},
-                            path=None,
-                            status="unavailable",
-                            progress=None,
-                            source="admin",
-                            assigned=True,
-                            read_only=True,
-                            provenance_label=str(access.get("provenance_label") or ""),
-                            available=False,
-                        )
+                        continue
+                    except Exception as exc:
+                        error_msg = f"Error building assigned KB '{name}': {exc}"
+                else:
+                    error_msg = f"Failed to load assigned KB '{name}'"
+                result.append(
+                    KnowledgeBaseInfo(
+                        id=rid,
+                        name=name,
+                        is_default=False,
+                        statistics={},
+                        metadata={"name": name, "last_error": error_msg},
+                        status="error",
+                        progress={
+                            "stage": "error",
+                            "message": "Failed to load assigned knowledge base info.",
+                            "error": error_msg,
+                        },
+                        source="admin",
+                        assigned=True,
+                        read_only=True,
+                        provenance_label=str(access.get("provenance_label") or ""),
                     )
-                    continue
-                resource = resolve_kb(str(access.get("id") or access.get("name") or ""))
-                assigned_manager = manager_for_resource(resource)
-                try:
-                    info = assigned_manager.get_info(resource.name)
-                    result.append(
-                        KnowledgeBaseInfo(
-                            id=resource.id,
-                            name=info["name"],
-                            is_default=False,
-                            statistics=info.get("statistics", {}),
-                            metadata=info.get("metadata"),
-                            path=None,
-                            status=info.get("status"),
-                            progress=info.get("progress"),
-                            source="admin",
-                            assigned=True,
-                            read_only=True,
-                            provenance_label=str(access.get("provenance_label") or ""),
-                        )
-                    )
-                except Exception as exc:
-                    error_msg = f"Error getting assigned KB '{resource.name}': {exc}"
-                    result.append(
-                        KnowledgeBaseInfo(
-                            id=resource.id,
-                            name=resource.name,
-                            is_default=False,
-                            statistics={},
-                            metadata={"name": resource.name, "last_error": error_msg},
-                            status="error",
-                            progress={
-                                "stage": "error",
-                                "message": "Failed to load assigned knowledge base info.",
-                                "error": error_msg,
-                            },
-                            source="admin",
-                            assigned=True,
-                            read_only=True,
-                            provenance_label=str(access.get("provenance_label") or ""),
-                        )
-                    )
-        return result
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_msg = f"Error listing knowledge bases: {e}"
-        logger.error(f"{error_msg}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to list knowledge bases: {e!s}")
+                )
+    return result
 
 
 @router.get("/{kb_name}")
