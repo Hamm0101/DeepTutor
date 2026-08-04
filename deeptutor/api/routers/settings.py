@@ -80,6 +80,10 @@ DEFAULT_UI_SETTINGS = {
     # connection timed out. Bumped from 60 → 180 so slow tools (image/video
     # generation) don't trip it; user-adjustable in Settings > Network.
     "chat_response_timeout": 180,
+    # Which set of math symbols the chat composer palette surfaces. Tiers
+    # follow the CN curriculum: elementary → middle → high → full. Set once
+    # from the palette's stage selector; the chat composer reads it client-side.
+    "math_input_level": "full",
 }
 
 # Bounds for the chat idle timeout (seconds): long enough for video renders,
@@ -101,6 +105,7 @@ class UISettings(BaseModel):
     code_block_theme: Optional[str] = None
     code_block_show_line_numbers: Optional[bool] = None
     code_block_wrap_long_lines: Optional[bool] = None
+    math_input_level: Literal["elementary", "middle", "high", "full"] = "full"
 
 
 class UISettingsUpdate(BaseModel):
@@ -123,6 +128,7 @@ class UISettingsUpdate(BaseModel):
     code_block_theme: str | None = None
     code_block_show_line_numbers: bool | None = None
     code_block_wrap_long_lines: bool | None = None
+    math_input_level: Literal["elementary", "middle", "high", "full"] | None = None
 
 
 class VoiceAutoplayUpdate(BaseModel):

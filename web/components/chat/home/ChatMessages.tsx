@@ -29,6 +29,7 @@ import { useTranslation } from "react-i18next";
 import type { SelectedHistorySession } from "@/components/chat/HistorySessionPicker";
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import AssistantResponse from "@/components/common/AssistantResponse";
+import MarkdownRenderer from "@/components/common/MarkdownRenderer";
 import {
   InlineFileCardProvider,
   mergeGeneratedFiles,
@@ -869,6 +870,30 @@ function DeleteTurnButton({ onDelete }: { onDelete: () => void }) {
   );
 }
 
+/**
+ * Render the user's message bubble. Unlike the assistant side (which always
+ * uses MarkdownRenderer), user messages are plain text by default but still
+ * need LaTeX math rendering when the math symbol palette inserted LaTeX
+ * (e.g. `$x^{2}$`, `$\frac{a}{b}$`). We detect math/content triggers and
+ * route through MarkdownRenderer only when needed — plain text stays as a
+ * fast whitespace-pre-wrap div to avoid unnecessary markdown parsing.
+ */
+function UserMessageContent({ content }: { content: string }) {
+  // Reuse the same detection signal as MarkdownRenderer so the user bubble
+  // lights up rich rendering exactly when math/code is present.
+  const hasMath = /(\\[a-zA-Z]+\{?|\^\{|\_\{|\$\$?|\\\(|\[)/.test(content);
+  if (!hasMath) {
+    return <div className="whitespace-pre-wrap">{content}</div>;
+  }
+  return (
+    <MarkdownRenderer
+      content={content}
+      variant="compact"
+      className="text-[14px] leading-relaxed"
+    />
+  );
+}
+
 const UserMessage = memo(function UserMessage({
   msg,
   index,
@@ -1032,7 +1057,7 @@ const UserMessage = memo(function UserMessage({
   ];
 
   return (
-    <div key={`${msg.role}-${index}`} className="group flex justify-end">
+    <div key={`${msg.role}-${index}`} className="group flex justify-end" style={{ contentVisibility: "auto", containIntrinsicSize: "200px" }}>
       {/* ``data-turn-key`` is the scroll target the turn navigator jumps
           to; ``data-turn-bubble`` is what it flashes on arrival. Both keys
           come from ``turnAnchorKey`` so the rail and the transcript can
@@ -1097,7 +1122,7 @@ const UserMessage = memo(function UserMessage({
             data-turn-bubble="true"
             className="rounded-2xl bg-[var(--secondary)] px-4 py-2.5 text-[14px] leading-relaxed text-[var(--foreground)] shadow-sm"
           >
-            <div className="whitespace-pre-wrap">{msg.content}</div>
+            <UserMessageContent content={msg.content} />
           </div>
         )}
         {!editing && refTreeItems.length > 0 && (
@@ -1409,7 +1434,15 @@ export const ChatMessageList = memo(function ChatMessageList({
         })();
 
         return (
-          <div key={`${msg.role}-${i}`} className="w-full">
+          <div
+            key={`${msg.role}-${i}`}
+            className="w-full"
+            style={
+              isActiveAssistant
+                ? undefined
+                : { contentVisibility: "auto", containIntrinsicSize: "400px" }
+            }
+          >
             <InlineFileCardProvider
               attachments={msg.attachments ?? []}
               events={msg.events}

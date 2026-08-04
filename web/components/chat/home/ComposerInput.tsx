@@ -91,6 +91,13 @@ export interface ComposerInputHandle {
    * auto-firing the message).
    */
   setValue: (value: string) => void;
+  /**
+   * Insert text at the current caret position, leaving the caret just after
+   * the inserted text (or `caretFromEnd` chars before its end — used to drop
+   * the caret inside the first `{}` of a LaTeX template). Used by the math
+   * symbol palette and the Ctrl+Shift+M/D delimiter shortcuts.
+   */
+  insertAtCursor: (text: string, caretFromEnd?: number) => void;
 }
 
 export function shouldOpenAtPopup(value: string, cursorPos: number): boolean {
@@ -211,6 +218,28 @@ export const ComposerInput = memo(
             });
           }
         },
+        insertAtCursor: (text: string, caretFromEnd?: number) => {
+          const el = textareaRef.current;
+          if (!el) return;
+          const start = el.selectionStart ?? inputRef.current.length;
+          const end = el.selectionEnd ?? inputRef.current.length;
+          const before = inputRef.current.slice(0, start);
+          const after = inputRef.current.slice(end);
+          const next = before + text + after;
+          setInputBoth(next);
+          onInputChange(next);
+          // Place the caret: end of inserted text by default, or
+          // `caretFromEnd` chars before it (inside the first `{}` of a
+          // template). Use rAF so the new value is flushed first.
+          const caretPos =
+            caretFromEnd != null
+              ? before.length + text.length - caretFromEnd
+              : before.length + text.length;
+          requestAnimationFrame(() => {
+            el.focus();
+            el.setSelectionRange(caretPos, caretPos);
+          });
+        },
       }),
       [setInputBoth, onInputChange, textareaRef],
     );
@@ -286,6 +315,36 @@ export const ComposerInput = memo(
 
     const handleKeyDown = useCallback(
       (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+        // Math delimiter shortcuts — Shift modifier avoids OS-level conflicts
+        // (Cmd+M minimizes windows on macOS; Ctrl+M does on some Linux DEs).
+        // Ctrl+Shift+M → inline `$…$`; Ctrl+Shift+D → block `$$…$$`.
+        if (
+          (e.ctrlKey || e.metaKey) &&
+          e.shiftKey &&
+          !e.altKey &&
+          (e.key === "M" || e.key === "m" || e.key === "D" || e.key === "d")
+        ) {
+          e.preventDefault();
+          const isBlock = e.key === "D" || e.key === "d";
+          const delim = isBlock ? "$$  $$" : "$$";
+          const caretFromEnd = isBlock ? 3 : 1;
+          // Insert at the current caret via the same path the palette uses.
+          const el = textareaRef.current;
+          if (!el) return;
+          const start = el.selectionStart ?? inputRef.current.length;
+          const end = el.selectionEnd ?? inputRef.current.length;
+          const before = inputRef.current.slice(0, start);
+          const after = inputRef.current.slice(end);
+          const next = before + delim + after;
+          setInputBoth(next);
+          onInputChange(next);
+          const caretPos = before.length + delim.length - caretFromEnd;
+          requestAnimationFrame(() => {
+            el.focus();
+            el.setSelectionRange(caretPos, caretPos);
+          });
+          return;
+        }
         // With the slash popup open, Enter/Tab confirm the command instead
         // of submitting "/persona" as a message.
         if (
@@ -327,6 +386,9 @@ export const ComposerInput = memo(
         filteredAgents,
         handleSelectAgentMention,
         isComposingRef,
+        setInputBoth,
+        onInputChange,
+        textareaRef,
       ],
     );
 

@@ -24,6 +24,7 @@ import {
   Mic,
   Paperclip,
   Plus,
+  Sigma,
   Sparkles,
   Square,
   UserRound,
@@ -45,9 +46,11 @@ import type { LLMOption } from "@/lib/llm-options";
 import ChatSpaceMenu from "@/components/chat/space/ChatSpaceMenu";
 import type { SpaceMemoryFile } from "@/lib/space-items";
 import type { SelectedBookReference } from "@/lib/book-references";
+import { wrapBareLatexForSending } from "@/lib/math-symbols";
 import AgentSelector from "./AgentSelector";
 import ContextBudgetChip, { type ContextBudget } from "./ContextBudgetChip";
 import KnowledgeSelector from "./KnowledgeSelector";
+import MathSymbolPalette from "./MathSymbolPalette";
 import ModelSelector from "./ModelSelector";
 import PersonaSelector from "./PersonaSelector";
 
@@ -372,6 +375,36 @@ export default memo(function ChatComposer({
   const restoreFocusOnReturnRef = useRef(false);
   const inputHandleRef = useRef<ComposerInputHandle>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Math symbol palette: a popover anchored to the ∑ button. Toggled from
+  // the toolbar; closes on outside click or Escape (Escape handled by the
+  // textarea's keydown → setShowMathPalette(false) is wired below).
+  const [mathPaletteOpen, setMathPaletteOpen] = useState(false);
+  const mathPaletteRef = useRef<HTMLDivElement>(null);
+  const mathBtnRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (!mathPaletteOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (
+        mathPaletteRef.current?.contains(target) ||
+        mathBtnRef.current?.contains(target)
+      )
+        return;
+      setMathPaletteOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMathPaletteOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [mathPaletteOpen]);
+  const insertMath = useCallback((latex: string, caretFromEnd?: number) => {
+    inputHandleRef.current?.insertAtCursor(latex, caretFromEnd);
+  }, []);
   if (lastCapMenuOpen !== capMenuOpen) {
     setLastCapMenuOpen(capMenuOpen);
     if (!capMenuOpen) setMoreCapsOpen(false);
@@ -482,7 +515,10 @@ export default memo(function ChatComposer({
 
   const doSend = useCallback(
     (content: string) => {
-      onSend(content);
+      // The math symbol palette inserts bare LaTeX (e.g. `x^{2}`, `\frac{}{}`)
+      // without `$` delimiters. Upgrade those fragments to inline math so the
+      // user bubble (and downstream markdown renderers) display them as math.
+      onSend(wrapBareLatexForSending(content));
       setHasContent(false);
       inputHandleRef.current?.clear();
       // Sending can move focus to the button or rerender the empty-state
@@ -1031,6 +1067,45 @@ export default memo(function ChatComposer({
                             onSelectQuestionBankPicker();
                           else if (key === "persona") onSelectPersonaPicker();
                           else if (key === "memory") onSelectMemoryPicker();
+                        }}
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+
+              {/* Math symbol palette trigger — surfaces a stage-filtered
+                  symbol picker so learners can insert LaTeX without
+                  memorizing commands. */}
+              <div className="relative flex shrink-0 items-center">
+                <button
+                  ref={mathBtnRef}
+                  type="button"
+                  onClick={() => setMathPaletteOpen((v) => !v)}
+                  title={t("Math symbols")}
+                  aria-label={t("Math symbols")}
+                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-[background-color,color,transform] duration-150 active:scale-90 ${
+                    mathPaletteOpen
+                      ? "bg-[var(--muted)] text-[var(--foreground)]"
+                      : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
+                  }`}
+                >
+                  <Sigma size={18} strokeWidth={1.8} />
+                </button>
+                <AnimatePresence>
+                  {mathPaletteOpen && (
+                    <motion.div
+                      ref={mathPaletteRef}
+                      className="absolute bottom-full left-0 z-50 mb-1.5"
+                      style={{ transformOrigin: "bottom left" }}
+                      initial={{ opacity: 0, y: 6, scale: 0.96 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: 4, scale: 0.97 }}
+                      transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+                    >
+                      <MathSymbolPalette
+                        onInsert={(latex, caretFromEnd) => {
+                          insertMath(latex, caretFromEnd);
                         }}
                       />
                     </motion.div>
