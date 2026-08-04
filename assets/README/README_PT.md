@@ -109,10 +109,10 @@ python -m pip install -e .
 ( cd web && npm ci --legacy-peer-deps )
 
 deeptutor init
-deeptutor start
+deeptutor start --dev
 ```
 
-As instalações a partir de fonte executam o Next.js em modo de desenvolvimento contra o diretório `web/` local; todo o resto (layout de configuração, portas, parar com `Ctrl+C`) corresponde à Opção 1.
+`deeptutor start` compila o frontend `web/` local para produção uma vez e reutiliza-o; `--dev` executa o Next.js com HMR. O layout de configuração, as portas e o `Ctrl+C` correspondem à Opção 1.
 
 <details>
 <summary><b>Ambiente Conda</b> (em vez de <code>venv</code>)</summary>
@@ -143,11 +143,11 @@ pip install -e ".[math-animator]"   # add-on Manim; requer LaTeX/ffmpeg/libs do 
 
 **Alterar dependências do frontend:** execute `npm install --legacy-peer-deps` para atualizar `web/package-lock.json`, depois confirme tanto `web/package.json` como `web/package-lock.json`.
 
-**Servidor de desenvolvimento bloqueado:** se `deeptutor start` reportar um frontend existente que não responde, pare o PID que imprime. Se não houver nenhum processo Next.js em execução, os ficheiros de bloqueio estão desatualizados — remova-os e tente novamente:
+**Servidor de desenvolvimento bloqueado:** se `deeptutor start --dev` reportar um frontend existente que não responde, pare o PID que imprime. Se não houver nenhum processo Next.js em execução, os ficheiros de bloqueio estão desatualizados — remova-os e tente novamente:
 
 ```bash
 rm -f web/.next/dev/lock web/.next/lock
-deeptutor start
+deeptutor start --dev
 ```
 
 </details>
@@ -490,7 +490,9 @@ Configurações é o plano de controlo operacional, com uma faixa de estado em t
 
 A maioria das secções usa um fluxo de rascunho e aplicação, para que possa testar um provedor antes de o confirmar. Quatro temas incluídos — Default, Cream, Dark e Glass. Os ficheiros `.env` da raiz do projeto são intencionalmente ignorados; a configuração de runtime vive sob `data/user/settings/*.json` a menos que `DEEPTUTOR_HOME` ou `deeptutor start --home` aponte a aplicação para outro lugar.
 
-**OpenAI Codex OAuth (experimental).** Escolher **OpenAI Codex** em Models → LLM substitui os campos de chave API por um login no navegador que corre contra o seu próprio plano ChatGPT, pelo que não é necessária nenhuma `OPENAI_API_KEY`. Os tokens vivem apenas em `data/system/user-secrets/<owner>/private/openai-codex/` — fora de qualquer árvore que o sandbox de execução possa alcançar — e o DeepTutor nunca lê nem modifica o seu login CLI `~/.codex`. A lista de modelos vem do catálogo ao vivo dessa conta; iniciar sessão publica o perfil mas só se torna o modelo ativo quando ainda não há nenhum LLM configurado, pelo que nunca redireciona uma implementação sem o seu conhecimento. Como um token autoriza o plano de uma pessoa, o perfil não é partilhável através de concessões de utilizador — cada conta inicia sessão por si própria, e o navegador tem de alcançar a máquina que executa o backend (num servidor remoto, execute `deeptutor provider login openai-codex` lá em vez disso). Erros de quota e falhas de catálogo são reportados tal como ocorrem e nunca recorrem a um provedor pago. Este caminho de compatibilidade é experimental: a interface upstream pode mudar.
+**OpenAI Codex OAuth (experimental).** Escolher **OpenAI Codex** em Models → LLM substitui os campos de chave API por um login no navegador que corre contra o seu próprio plano ChatGPT, pelo que não é necessária nenhuma `OPENAI_API_KEY`. Os tokens vivem apenas em `data/system/user-secrets/<owner>/private/openai-codex/` — na implementação multi-contentor com Compose, fora de qualquer árvore que o sandbox de execução possa alcançar — e o DeepTutor nunca lê nem modifica o seu login CLI `~/.codex`. A lista de modelos vem do catálogo ao vivo dessa conta; iniciar sessão publica o perfil mas só se torna o modelo ativo quando ainda não há nenhum LLM configurado, pelo que nunca redireciona uma implementação sem o seu conhecimento. Como um token autoriza o plano de uma pessoa, o perfil não é partilhável através de concessões de utilizador — cada conta inicia sessão por si própria, e o navegador tem de alcançar a máquina que executa o backend (num servidor remoto, execute `deeptutor provider login openai-codex` lá em vez disso). Erros de quota e falhas de catálogo são reportados tal como ocorrem e nunca recorrem a um provedor pago. Este caminho de compatibilidade é experimental: a interface upstream pode mudar.
+
+As implementações locais predefinidas com Docker e Podman usam redes loopback separadas e precisam de uma ponte temporária durante o início de sessão. Siga o [guia da ponte OAuth temporária local do Codex](../../CONTAINERIZATION.md#temporary-local-codex-oauth-bridge) para os comandos exatos de Docker, Compose, Podman e desmontagem.
 
 Para uma implementação remota, o `localhost` do navegador e o `localhost` do servidor são máquinas diferentes, pelo que um proxy inverso comum sozinho não consegue transportar o callback localhost do navegador até ao servidor. Use um túnel SSH como ponte de callback. O túnel alcança a porta Web já publicada; o Next.js reencaminha apenas o caminho exato de callback para o broker de callback público, e o broker valida `state` antes de encaminhar para a operação OAuth original. O listener de callback permanece no loopback do backend, as portas `1455` e `1457` não são publicadas, e este caminho suporta a rede bridge predefinida do Docker.
 
@@ -581,7 +583,7 @@ O repositório inclui um [`SKILL.md`](../../SKILL.md) raiz — um documento de t
 | Comando | Descrição |
 |:---|:---|
 | `deeptutor init` | Criar ou atualizar `data/user/settings` para o espaço de trabalho atual |
-| `deeptutor start [--home PATH]` | Lançar backend + frontend juntos |
+| `deeptutor start [--home PATH] [--dev]` | Lançar backend + frontend juntos |
 | `deeptutor serve [--port PORT]` | Iniciar apenas o backend FastAPI |
 | `deeptutor run <capability> <message>` | Executar um turno de capacidade único (`chat`, `deep_solve`, `deep_question`, `deep_research`, `visualize`, `math_animator`, `mastery_path`); adicionar `--format json` para saída NDJSON |
 | `deeptutor chat` | REPL interativo com controlos de capacidade, ferramenta, KB, notebook e histórico |
