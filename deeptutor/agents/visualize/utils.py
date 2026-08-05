@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import shutil
-import subprocess
-from pathlib import Path
 
 import defusedxml.ElementTree as ET
 
@@ -113,171 +109,6 @@ def _strip_outer_fence(text: str) -> str:
     return match.group(1).strip() if match else stripped
 
 
-# --- Mermaid real-syntax validation (opportunistic, zero new deps) ----------
-_MERMAID_VALIDATOR_SCRIPT = Path(__file__).parent / "_mermaid_validator.mjs"
-
-# Cache for the (node, mermaid_entry) probe so repeated validations don't
-# re-stat. Empty list = not yet probed; one element = probed (may be None).
-_MERMAID_TOOLCHAIN_CACHE: list[tuple[str, Path] | None] = []
-
-
-def _find_mermaid_entry() -> Path | None:
-    """Locate the mermaid ESM bundle to import in Node, or ``None``.
-
-    Reuses the frontend's installed mermaid (same version the browser renders,
-    so parse semantics match). Checked in priority order: an explicit operator
-    override (``DEEPTUTOR_MERMAID_PATH``), then the source-checkout
-    ``web/node_modules``. Absent in pip-only installs → ``None`` (lenient).
-    """
-    override = os.environ.get("DEEPTUTOR_MERMAID_PATH")
-    if override:
-        candidate = Path(override)
-        if candidate.is_file():
-            return candidate
-    # utils.py lives at <repo>/deeptutor/agents/visualize/utils.py in a source
-    # checkout → parents[3] is the repo root holding web/node_modules.
-    candidate = (
-        Path(__file__).resolve().parents[3]
-        / "web"
-        / "node_modules"
-        / "mermaid"
-        / "dist"
-        / "mermaid.core.mjs"
-    )
-    if candidate.is_file():
-        return candidate
-    return None
-
-
-def _mermaid_toolchain() -> tuple[str, Path] | None:
-    """Return ``(node_path, mermaid_entry)`` if usable, else ``None`` (cached)."""
-    if _MERMAID_TOOLCHAIN_CACHE:
-        return _MERMAID_TOOLCHAIN_CACHE[0]
-    node = shutil.which("node")
-    entry = _find_mermaid_entry() if node else None
-    result: tuple[str, Path] | None = (
-        (node, entry)
-        if (node and entry and _MERMAID_VALIDATOR_SCRIPT.is_file())
-        else None
-    )
-    _MERMAID_TOOLCHAIN_CACHE.append(result)
-    return result
-
-
-def _validate_mermaid_with_node(code: str) -> tuple[bool, str] | None:
-    """Run a real ``mermaid.parse()`` check via Node.
-
-    Returns ``(ok, error)`` from the parser, or ``None`` when the Node/mermaid
-    toolchain is unavailable, crashed, or timed out — in which case the caller
-    falls back to the lenient keyword-only gate (never worse than today).
-
-    Only stable jison markers ("Parse error on line", "No diagram type
-    detected") count as real syntax errors; DOMPurify/headless noise is treated
-    as valid (see ``_mermaid_validator.mjs``).
-    """
-    toolchain = _mermaid_toolchain()
-    if not toolchain:
-        return None
-    node, entry = toolchain
-    try:
-        proc = subprocess.run(
-            [node, str(_MERMAID_VALIDATOR_SCRIPT), str(entry)],
-            input=code,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=5.0,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        payload = json.loads(proc.stdout)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if payload.get("ok"):
-        return True, ""
-    return False, str(payload.get("error") or "Mermaid syntax error.")
-
-
-def _validate_mermaid_mindmap_static(text: str) -> tuple[bool, str] | None:
-    """Static heuristic check for mindmap bare-line / formula-label errors.
-
-    headless ``mermaid.parse()`` is unreliable for mindmap: every mindmap
-    (valid or not) aborts at the DOMPurify step with
-    "DOMPurify.addHook is not a function" before jison syntax errors surface,
-    so the Node-backed validator lenient-passes broken mindmaps (verified by
-    repro: a bare-formula mindmap and a valid mindmap return the *same*
-    DOMPurify-noise payload). This pure-Python check catches the two failure
-    modes LLMs hit most:
-
-      1. bare text/formula lines — no node ID, no shape delimiter — which
-         throw jison ``Expecting 'SPACELINE', 'NL', 'EOF', got 'NODE_DSTART'``
-         at browser render time;
-      2. node labels containing ``=`` (formulas/equations) — these reliably
-         break mindmap parsing regardless of escaping, so they are rejected
-         outright with a prompt to switch to flowchart or html.
-
-    Returns ``(ok, error)`` for the first offending line, or ``None`` when the
-    source is not a mindmap diagram (so the caller falls back to the keyword
-    gate + Node parse path for other diagram types).
-    """
-    lines = text.splitlines()
-    # find the mindmap block: the first non-empty line must be the keyword.
-    start: int | None = None
-    for i, raw in enumerate(lines):
-        s = raw.strip()
-        if not s:
-            continue
-        if s == "mindmap" or s.startswith("mindmap "):
-            start = i + 1
-            break
-        # first non-empty line is a different diagram keyword → not mindmap
-        return None
-    if start is None:
-        return None
-
-    keywords_lower = {k.lower() for k in _MERMAID_KEYWORDS}
-    for j in range(start, len(lines)):
-        raw = lines[j]
-        stripped = raw.strip()
-        if not stripped:
-            continue
-        # a new diagram keyword ends the mindmap block
-        if stripped.lower() in keywords_lower:
-            break
-        # skip comments and class/icon annotations
-        if stripped.startswith("%%") or stripped.startswith("::"):
-            continue
-        # A valid mindmap node line (after stripping indentation) must be
-        # `id[label]` / `id(label)` / `id((label))` / ... — an optional ID
-        # followed by a shape delimiter. A bare text/formula line like
-        # `a² - b² = (a + b)(a - b)  applies: ...` has no ID and no shape
-        # delimiter and is the documented NODE_DSTART failure.
-        m = re.match(r"^([A-Za-z][\w-]*)?\s*([\[\(\{])", stripped)
-        if not m:
-            return False, (
-                f"mindmap line {j + 1} is a bare text/formula line — every "
-                "mindmap node must be `id[label]` (or a shape variant like "
-                "`id(label)` / `id((label))`). For formulas/equations use "
-                "flowchart or html, not mindmap."
-            )
-        # The shape-delimited content (label area) must not contain `=`:
-        # formulas/equations in mindmap labels reliably break mermaid
-        # parsing regardless of quoting/escaping. IDs cannot contain `=`,
-        # so any `=` here lives inside the label.
-        content = stripped[m.start(2):]
-        if "=" in content:
-            return False, (
-                f"mindmap line {j + 1} label contains '=' (formula/equation). "
-                "Formulas in mindmap labels reliably break mermaid parsing. "
-                "Use flowchart (e.g. `id1[\"a²-b²=(a+b)(a-b)\"]`) or html "
-                "(KaTeX) for formula content."
-            )
-    return True, ""
-
-
 def validate_visualization(code: str, render_type: str) -> tuple[bool, str]:
     """Cheap, deterministic, local render-ability check.
 
@@ -330,40 +161,17 @@ def validate_visualization(code: str, render_type: str) -> tuple[bool, str]:
     if render_type == "mermaid":
         first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
         # `---` front-matter and `%%{init}` directives are valid lead-ins.
-        if not (
+        if (
             first_line.startswith(_MERMAID_KEYWORDS)
             or first_line.startswith("%%")
             or first_line.startswith("---")
         ):
-            return False, (
-                "Mermaid code must start with a valid diagram keyword (graph, "
-                "flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, "
-                "erDiagram, gantt, mindmap, ...)."
-            )
-        # mindmap-specific static check: headless mermaid.parse() is
-        # unreliable for mindmap — DOMPurify noise masks jison errors
-        # (verified by repro: a bare-formula mindmap and a valid mindmap
-        # both return the same DOMPurify-noise payload), so validate
-        # mindmap structure here in pure Python. The static gate catches
-        # the known failure modes (bare lines, formula labels); on pass we
-        # trust it because Node parse would only lenient-pass anyway.
-        mindmap_check = _validate_mermaid_mindmap_static(text)
-        if mindmap_check is not None:
-            ok, error = mindmap_check
-            return (True, "") if ok else (False, error)
-        # Keyword gate passed. Opportunistically run a REAL ``mermaid.parse()``
-        # check via Node when the toolchain is available: this catches the
-        # syntax errors LLMs most often make (unescaped special chars in labels,
-        # unclosed brackets, reserved words as node IDs) with a precise,
-        # line-numbered message that drives the single repair pass. If Node or
-        # the mermaid bundle isn't present, or the check is inconclusive
-        # (mermaid's DOMPurify step can't run headless), we lenient-pass — never
-        # worse than the keyword-only gate. See ``_mermaid_validator.mjs``.
-        deep = _validate_mermaid_with_node(text)
-        if deep is None:
             return True, ""
-        ok, error = deep
-        return (True, "") if ok else (False, error)
+        return False, (
+            "Mermaid code must start with a valid diagram keyword (graph, "
+            "flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, "
+            "erDiagram, gantt, mindmap, ...)."
+        )
 
     if render_type == "html":
         if is_valid_html_document(text):

@@ -109,22 +109,9 @@ rules_mermaid: |
     journey / timeline。
   - 节点 ID 不含空格——用 camelCase 或下划线。显示文字放在方括号里：
     `nodeId[显示标签]`。绝不用保留字（end、graph、subgraph、class）作为裸节点 ID。
-  - 标签含特殊字符——圆括号 `()`、方括号 `[]`、冒号、引号或任何非纯字母数字空格连字符
-    ——必须用双引号包起来，避免被解析成形状 / 边的语法。写 `A["foo (bar)"]`，不要写
-    `A[foo(bar)]`；裸 `(` 是解析错误，会让整张图失败。`]`、`|`、`>`、`"` 同理。
   - 数据库模式 / ERD 用 `erDiagram`；类结构用 `classDiagram`。这些布局问题
     Mermaid 会自动解决——不要在 SVG 里手画。
   - 标签简短可读；核对图表类型关键词与你描述的结构一致。
-  - mindmap 专项（最重要，含公式/等式必炸）：mindmap 用缩进表达层级，每个节点
-    **必须**写成 `id[文本]`（或 `id(文本)` / `id((文本))` 等带形状界定符的形式）。
-    **绝不**写裸文本行——像 `a² - b² = (a + b)(a - b)        适用：两数之差`
-    这样的行没有节点 ID 也没有形状界定符，mermaid 会报
-    `Expecting 'SPACELINE', 'NL', 'EOF', got 'NODE_DSTART'`，整张图渲染失败。
-    公式 / 等式 / 含 `=` 的表达式 / 含连续括号 `((` 的内容**严禁**放进 mindmap
-    节点标签——这类内容在 mindmap 下无论怎么转义都会触发 jison 边界 case。改用
-    flowchart（节点 ID + 方括号标签，例如 `id1["a²-b²=(a+b)(a-b)"]`）或 html
-    （用 KaTeX 渲染公式）。mindmap 适合：概念层级、关键词脑图、不含公式的结构化梳理；
-    mindmap **不**适合：任何带数学公式的知识点——务必换 flowchart 或 html。
 
 rules_html: |
   渲染类型：HTML。输出一个完整、自包含的单文件 HTML 页面，用于交互式讲解、分步

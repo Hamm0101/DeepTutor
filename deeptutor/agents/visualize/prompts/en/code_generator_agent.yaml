@@ -130,30 +130,11 @@ rules_mermaid: |
   - Node IDs contain no spaces — use camelCase or under_scores. Put display text
     in brackets: `nodeId[Display label]`. Never use reserved words (end, graph,
     subgraph, class) as bare node IDs.
-  - Labels with special characters — parentheses `()`, square brackets `[]`,
-    colons, quotes, or anything not plain `[A-Za-z0-9 -]` — MUST be wrapped in
-    double quotes so the parser doesn't read them as shape/edge syntax. Write
-    `A["foo (bar)"]`, never `A[foo(bar)]` — a bare `(` is a parse error that
-    fails the whole diagram. Same for `]`, `|`, `>`, `"`.
   - For database schemas / ERDs, use `erDiagram`; for class structure use
     `classDiagram`. These are layout problems Mermaid solves for free — don't
     hand-draw them in SVG.
   - Keep labels short and readable; check the diagram type keyword matches the
     structure you're describing.
-  - mindmap specifics (critical — formulas/equations always break): mindmap
-    uses indentation for hierarchy; every node **MUST** be written as
-    `id[text]` (or `id(text)` / `id((text))` — any form with a shape delimiter).
-    **NEVER** write a bare text line — a line like
-    `a² - b² = (a + b)(a - b)        applies: difference of two numbers` has no
-    node ID and no shape delimiter, so mermaid throws
-    `Expecting 'SPACELINE', 'NL', 'EOF', got 'NODE_DSTART'` and the whole
-    diagram fails. Formulas / equations / anything containing `=` / consecutive
-    `((` **MUST NOT** go into mindmap node labels — they reliably trip jison
-    edge cases regardless of escaping. Use flowchart (node ID + bracketed
-    label, e.g. `id1["a²-b²=(a+b)(a-b)"]`) or html (KaTeX renders the formula)
-    instead. mindmap suits concept hierarchies, keyword maps, structured
-    outlines without formulas; mindmap does **NOT** suit any knowledge point
-    involving math formulas — switch to flowchart or html.
 
 rules_html: |
   Render type: HTML. Output one complete, self-contained single-file HTML page
