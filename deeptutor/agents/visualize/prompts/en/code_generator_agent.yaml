@@ -130,6 +130,11 @@ rules_mermaid: |
   - Node IDs contain no spaces — use camelCase or under_scores. Put display text
     in brackets: `nodeId[Display label]`. Never use reserved words (end, graph,
     subgraph, class) as bare node IDs.
+  - Labels with special characters — parentheses `()`, square brackets `[]`,
+    colons, quotes, or anything not plain `[A-Za-z0-9 -]` — MUST be wrapped in
+    double quotes so the parser doesn't read them as shape/edge syntax. Write
+    `A["foo (bar)"]`, never `A[foo(bar)]` — a bare `(` is a parse error that
+    fails the whole diagram. Same for `]`, `|`, `>`, `"`.
   - For database schemas / ERDs, use `erDiagram`; for class structure use
     `classDiagram`. These are layout problems Mermaid solves for free — don't
     hand-draw them in SVG.
