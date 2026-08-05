@@ -145,3 +145,53 @@ def test_mermaid_real_parse_lenient_on_valid_flowchart() -> None:
         "flowchart TD\nA[Start] --> B{Decision}\nB -->|Yes| C[Do it]", "mermaid"
     )
     assert ok
+
+
+# --- Mermaid mindmap static gate (no Node required) -------------------------
+# headless mermaid.parse() is unreliable for mindmap: every mindmap (valid or
+# not) aborts at the DOMPurify step with the same "DOMPurify.addHook is not a
+# function" payload, so the Node-backed validator lenient-passes broken
+# mindmaps. The pure-Python static gate must catch the failure modes without
+# Node — these tests run in every environment.
+def test_mermaid_mindmap_bare_formula_line_fails() -> None:
+    # Regression for the reported browser-render failure: a bare text/formula
+    # line (no node ID, no shape delimiter) throws NODE_DSTART at render time,
+    # but headless mermaid.parse() lenient-passes it (DOMPurify noise masks
+    # the jison error). The static gate must catch it without Node.
+    ok, err = validate_visualization(
+        "mindmap\n"
+        "  root(平方差公式)\n"
+        "    a² - b² = (a + b)(a - b)        适用：两数之差",
+        "mermaid",
+    )
+    assert not ok
+    assert "mindmap" in err
+    assert "bare" in err
+
+
+def test_mermaid_mindmap_valid_shaped_nodes_passes() -> None:
+    # A well-formed mindmap — every node has an ID + a shape delimiter and no
+    # formula in any label — must pass the static gate (and thus the whole
+    # validator) without Node. No false rejection.
+    ok, _ = validate_visualization(
+        "mindmap\n"
+        "  root[平方差公式]\n"
+        "    id1[定义]\n"
+        "    id2[几何意义]\n"
+        "    id3[适用范围]",
+        "mermaid",
+    )
+    assert ok
+
+
+def test_mermaid_mindmap_formula_label_rejected() -> None:
+    # Even when the formula is wrapped in double quotes (the pre-existing
+    # guardrail rule), a `=` inside a mindmap node label reliably breaks
+    # parsing. The static gate rejects it and points the LLM to flowchart/html.
+    ok, err = validate_visualization(
+        'mindmap\n  root["a² - b² = (a + b)(a - b)"]',
+        "mermaid",
+    )
+    assert not ok
+    assert "formula" in err
+    assert "flowchart" in err

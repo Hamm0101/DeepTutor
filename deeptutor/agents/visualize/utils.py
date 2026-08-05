@@ -201,6 +201,83 @@ def _validate_mermaid_with_node(code: str) -> tuple[bool, str] | None:
     return False, str(payload.get("error") or "Mermaid syntax error.")
 
 
+def _validate_mermaid_mindmap_static(text: str) -> tuple[bool, str] | None:
+    """Static heuristic check for mindmap bare-line / formula-label errors.
+
+    headless ``mermaid.parse()`` is unreliable for mindmap: every mindmap
+    (valid or not) aborts at the DOMPurify step with
+    "DOMPurify.addHook is not a function" before jison syntax errors surface,
+    so the Node-backed validator lenient-passes broken mindmaps (verified by
+    repro: a bare-formula mindmap and a valid mindmap return the *same*
+    DOMPurify-noise payload). This pure-Python check catches the two failure
+    modes LLMs hit most:
+
+      1. bare text/formula lines — no node ID, no shape delimiter — which
+         throw jison ``Expecting 'SPACELINE', 'NL', 'EOF', got 'NODE_DSTART'``
+         at browser render time;
+      2. node labels containing ``=`` (formulas/equations) — these reliably
+         break mindmap parsing regardless of escaping, so they are rejected
+         outright with a prompt to switch to flowchart or html.
+
+    Returns ``(ok, error)`` for the first offending line, or ``None`` when the
+    source is not a mindmap diagram (so the caller falls back to the keyword
+    gate + Node parse path for other diagram types).
+    """
+    lines = text.splitlines()
+    # find the mindmap block: the first non-empty line must be the keyword.
+    start: int | None = None
+    for i, raw in enumerate(lines):
+        s = raw.strip()
+        if not s:
+            continue
+        if s == "mindmap" or s.startswith("mindmap "):
+            start = i + 1
+            break
+        # first non-empty line is a different diagram keyword → not mindmap
+        return None
+    if start is None:
+        return None
+
+    keywords_lower = {k.lower() for k in _MERMAID_KEYWORDS}
+    for j in range(start, len(lines)):
+        raw = lines[j]
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # a new diagram keyword ends the mindmap block
+        if stripped.lower() in keywords_lower:
+            break
+        # skip comments and class/icon annotations
+        if stripped.startswith("%%") or stripped.startswith("::"):
+            continue
+        # A valid mindmap node line (after stripping indentation) must be
+        # `id[label]` / `id(label)` / `id((label))` / ... — an optional ID
+        # followed by a shape delimiter. A bare text/formula line like
+        # `a² - b² = (a + b)(a - b)  applies: ...` has no ID and no shape
+        # delimiter and is the documented NODE_DSTART failure.
+        m = re.match(r"^([A-Za-z][\w-]*)?\s*([\[\(\{])", stripped)
+        if not m:
+            return False, (
+                f"mindmap line {j + 1} is a bare text/formula line — every "
+                "mindmap node must be `id[label]` (or a shape variant like "
+                "`id(label)` / `id((label))`). For formulas/equations use "
+                "flowchart or html, not mindmap."
+            )
+        # The shape-delimited content (label area) must not contain `=`:
+        # formulas/equations in mindmap labels reliably break mermaid
+        # parsing regardless of quoting/escaping. IDs cannot contain `=`,
+        # so any `=` here lives inside the label.
+        content = stripped[m.start(2):]
+        if "=" in content:
+            return False, (
+                f"mindmap line {j + 1} label contains '=' (formula/equation). "
+                "Formulas in mindmap labels reliably break mermaid parsing. "
+                "Use flowchart (e.g. `id1[\"a²-b²=(a+b)(a-b)\"]`) or html "
+                "(KaTeX) for formula content."
+            )
+    return True, ""
+
+
 def validate_visualization(code: str, render_type: str) -> tuple[bool, str]:
     """Cheap, deterministic, local render-ability check.
 
@@ -263,6 +340,17 @@ def validate_visualization(code: str, render_type: str) -> tuple[bool, str]:
                 "flowchart, sequenceDiagram, classDiagram, stateDiagram-v2, "
                 "erDiagram, gantt, mindmap, ...)."
             )
+        # mindmap-specific static check: headless mermaid.parse() is
+        # unreliable for mindmap — DOMPurify noise masks jison errors
+        # (verified by repro: a bare-formula mindmap and a valid mindmap
+        # both return the same DOMPurify-noise payload), so validate
+        # mindmap structure here in pure Python. The static gate catches
+        # the known failure modes (bare lines, formula labels); on pass we
+        # trust it because Node parse would only lenient-pass anyway.
+        mindmap_check = _validate_mermaid_mindmap_static(text)
+        if mindmap_check is not None:
+            ok, error = mindmap_check
+            return (True, "") if ok else (False, error)
         # Keyword gate passed. Opportunistically run a REAL ``mermaid.parse()``
         # check via Node when the toolchain is available: this catches the
         # syntax errors LLMs most often make (unescaped special chars in labels,
