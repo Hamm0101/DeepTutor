@@ -1037,6 +1037,12 @@ export function UnifiedChatProvider({
   const loadSessionRef = useRef<((sessionId: string) => Promise<void>) | null>(
     null,
   );
+  // Turn id of the turn this terminal last completed through its local
+  // runner. The passive (session-level) subscription receives a duplicate
+  // copy of that turn's ``done`` — ``activeTurnId`` is cleared by STREAM_END
+  // before the duplicate arrives, so this ref is the stable marker that the
+  // turn was handled locally and its passive copies must be dropped.
+  const localTurnRef = useRef<string | null>(null);
 
   useLayoutEffect(() => {
     stateRef.current = state;
@@ -1114,6 +1120,10 @@ export function UnifiedChatProvider({
       const session = stateRef.current.sessions[sessionKey];
       const localTurnId = session?.activeTurnId || null;
       if (localTurnId && event.turn_id === localTurnId) return;
+      // Own turn just finished locally: ``activeTurnId`` was cleared by
+      // STREAM_END, so the passive copy of the same ``done`` is matched by
+      // the turn id remembered at local completion instead.
+      if (event.turn_id && event.turn_id === localTurnRef.current) return;
 
       if (event.type === "session_meta") {
         // Remote title generation — same handling as the local path.
@@ -1218,6 +1228,10 @@ export function UnifiedChatProvider({
         return;
       }
       if (event.type === "done") {
+        // Remember the locally-completed turn so the passive (session-level)
+        // subscription can drop its duplicate ``done`` copy even after
+        // STREAM_END clears ``activeTurnId`` below.
+        if (event.turn_id) localTurnRef.current = event.turn_id;
         const status = String(
           (event.metadata as { status?: string } | undefined)?.status ||
             "completed",
