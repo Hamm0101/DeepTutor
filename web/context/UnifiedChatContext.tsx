@@ -1037,11 +1037,12 @@ export function UnifiedChatProvider({
   const loadSessionRef = useRef<((sessionId: string) => Promise<void>) | null>(
     null,
   );
-  // Turn id of the turn this terminal last completed through its local
-  // runner. The passive (session-level) subscription receives a duplicate
-  // copy of that turn's ``done`` — ``activeTurnId`` is cleared by STREAM_END
-  // before the duplicate arrives, so this ref is the stable marker that the
-  // turn was handled locally and its passive copies must be dropped.
+  // Turn id of the last turn this terminal's local pipeline processed.
+  // The passive (session-level) subscription receives duplicate copies of
+  // local turns' events, and this ref is the authoritative "handled by my
+  // local runner" marker for the passive gate. Snapshot-derived state must
+  // NOT be used for that purpose: reloading while another terminal's turn
+  // is running puts that remote turn id into ``activeTurnId``.
   const localTurnRef = useRef<string | null>(null);
 
   useLayoutEffect(() => {
@@ -1116,13 +1117,11 @@ export function UnifiedChatProvider({
     (sessionKey: string, event: StreamEvent) => {
       // Events of turns this terminal started itself are handled by the
       // local runner — drop their duplicates arriving via the session
-      // subscription (the backend broadcasts each event to both).
-      const session = stateRef.current.sessions[sessionKey];
-      const localTurnId = session?.activeTurnId || null;
-      if (localTurnId && event.turn_id === localTurnId) return;
-      // Own turn just finished locally: ``activeTurnId`` was cleared by
-      // STREAM_END, so the passive copy of the same ``done`` is matched by
-      // the turn id remembered at local completion instead.
+      // subscription (the backend broadcasts each event to both). Only the
+      // local pipeline sets ``localTurnRef``; a snapshot-derived
+      // ``activeTurnId`` (e.g. reloading while another terminal's turn is
+      // running) must NOT make a remote turn look local, so the gate must
+      // not compare against it.
       if (event.turn_id && event.turn_id === localTurnRef.current) return;
 
       if (event.type === "session_meta") {
@@ -1187,6 +1186,12 @@ export function UnifiedChatProvider({
       // the session id, so a lookup here would collide).
       const runner = runnersRef.current.get(runnerKey);
       const effectiveKey = runner?.key || runnerKey;
+      // Mark any turn this terminal's local pipeline sees — the
+      // authoritative "handled locally" signal for the passive branch's
+      // dedup gate. Set on every local event so it is populated before any
+      // passive duplicate can arrive; snapshot-derived state (activeTurnId
+      // from a REST reload) must never be trusted as "local".
+      if (event.turn_id) localTurnRef.current = event.turn_id;
       if (event.type === "session") {
         const sessionId =
           (event.metadata as { session_id?: string } | undefined)?.session_id ||
@@ -1228,10 +1233,6 @@ export function UnifiedChatProvider({
         return;
       }
       if (event.type === "done") {
-        // Remember the locally-completed turn so the passive (session-level)
-        // subscription can drop its duplicate ``done`` copy even after
-        // STREAM_END clears ``activeTurnId`` below.
-        if (event.turn_id) localTurnRef.current = event.turn_id;
         const status = String(
           (event.metadata as { status?: string } | undefined)?.status ||
             "completed",
