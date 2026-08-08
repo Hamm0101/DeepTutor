@@ -9,6 +9,7 @@ import React, {
   useMemo,
   useReducer,
   useRef,
+  useState,
 } from "react";
 import {
   LANGUAGE_EVENT,
@@ -781,6 +782,12 @@ const initialState: ProviderState = {
 // pushes like the LLM-generated ``session_meta`` title update to land.
 const POST_DONE_DISCONNECT_DELAY_MS = 15_000;
 
+// Delay before recreating a passive (session-level) subscription runner
+// after the WS client exhausted its reconnect attempts. The passive
+// subscription must keep trying — a missed reconnect would silently
+// stop cross-terminal sync.
+const PASSIVE_RECONNECT_DELAY_MS = 5_000;
+
 interface ChatContextValue {
   state: ChatState;
   setTools: (tools: string[]) => void;
@@ -841,6 +848,10 @@ interface ChatContextValue {
    *  it isn't in memory, i.e. the caller must load it. */
   showCachedSession: (sessionId: string) => boolean;
   selectedSessionId: string | null;
+  /** Set the session currently viewed in the chat page (null when leaving
+   *  the page). Drives the passive cross-terminal subscription lifecycle:
+   *  subscribe on enter, switch with the page, unsubscribe on leave. */
+  setActiveView: (sessionId: string | null) => void;
   sessionStatuses: Record<string, SessionStatusSnapshot>;
   sidebarRefreshToken: number;
 }
@@ -997,6 +1008,23 @@ export function UnifiedChatProvider({
       }
     >
   >(new Map());
+  // Passive session-level subscribers (cross-terminal sync): one dedicated
+  // WS client per viewed session, observing every turn's live events. Kept
+  // separate from ``runnersRef`` (local turn runners) so a finished local
+  // turn's disconnect never tears down the passive subscription — and the
+  // passive client never sends ``start_turn`` / ``resume_from``.
+  const passiveRunnersRef = useRef<
+    Map<
+      string,
+      {
+        key: string;
+        client: UnifiedWSClient;
+      }
+    >
+  >(new Map());
+  // Session currently displayed in the chat page (null = not viewing one).
+  // Drives the passive subscription lifecycle.
+  const [viewingSessionId, setViewingSessionId] = useState<string | null>(null);
   const draftCounterRef = useRef(0);
   const retryTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
   // Tracks in-flight regenerate requests so we can restore the popped
@@ -1018,6 +1046,8 @@ export function UnifiedChatProvider({
     () => () => {
       runnersRef.current.forEach(({ client }) => client.disconnect());
       runnersRef.current.clear();
+      passiveRunnersRef.current.forEach(({ client }) => client.disconnect());
+      passiveRunnersRef.current.clear();
       retryTimersRef.current.forEach((id) => clearTimeout(id));
       retryTimersRef.current.clear();
     },
@@ -1071,8 +1101,81 @@ export function UnifiedChatProvider({
     runnersRef.current.set(newKey, runner);
   }, []);
 
+  // Remote-turn events arriving via the passive (session-level) subscription
+  // — turns started by another terminal on the same account. Phase 1 keeps
+  // this minimal: ignore streaming content (the reducer would otherwise
+  // synthesize an orphan assistant bubble), and sync the full transcript
+  // when a remote turn finishes. Phase 2 can upgrade to live assembly.
+  const handlePassiveRunnerEvent = useCallback(
+    (sessionKey: string, event: StreamEvent) => {
+      // Events of turns this terminal started itself are handled by the
+      // local runner — drop their duplicates arriving via the session
+      // subscription (the backend broadcasts each event to both).
+      const session = stateRef.current.sessions[sessionKey];
+      const localTurnId = session?.activeTurnId || null;
+      if (localTurnId && event.turn_id === localTurnId) return;
+
+      if (event.type === "session_meta") {
+        // Remote title generation — same handling as the local path.
+        const title = String(
+          (event.metadata as { title?: string } | undefined)?.title || "",
+        ).trim();
+        if (title) {
+          dispatch({ type: "SET_SESSION_TITLE", key: sessionKey, title });
+        } else {
+          dispatch({ type: "BUMP_SIDEBAR_REFRESH" });
+        }
+        return;
+      }
+      if (event.type === "done") {
+        const status = String(
+          (event.metadata as { status?: string } | undefined)?.status ||
+            "completed",
+        );
+        dispatch({
+          type: "STREAM_END",
+          key: sessionKey,
+          status: (status as SessionRuntimeStatus) || "completed",
+          turnId: event.turn_id || null,
+        });
+        // Phase 1 sync: refresh the transcript so the remote turn's
+        // messages appear. (RECONCILE_TURN is pointless here — remote
+        // turns have no local optimistic messages to swap ids for.)
+        loadSessionRef.current?.(sessionKey).catch(() => {
+          /* non-fatal — local state remains usable */
+        });
+        return;
+      }
+      if (event.type === "error") {
+        const terminal = Boolean(
+          (event.metadata as { turn_terminal?: boolean } | undefined)
+            ?.turn_terminal,
+        );
+        if (terminal) {
+          dispatch({
+            type: "STREAM_END",
+            key: sessionKey,
+            status: "failed",
+            turnId: event.turn_id || null,
+          });
+          loadSessionRef.current?.(sessionKey).catch(() => {
+            /* non-fatal — local state remains usable */
+          });
+        }
+        return;
+      }
+      // Phase 1: drop streaming content/stage events from remote turns.
+    },
+    [],
+  );
+
   const handleRunnerEvent = useCallback(
     (runnerKey: string, event: StreamEvent) => {
+      const passiveRunner = passiveRunnersRef.current.get(runnerKey);
+      if (passiveRunner) {
+        handlePassiveRunnerEvent(runnerKey, event);
+        return;
+      }
       const runner = runnersRef.current.get(runnerKey);
       const effectiveKey = runner?.key || runnerKey;
       if (event.type === "session") {
@@ -1218,8 +1321,53 @@ export function UnifiedChatProvider({
         });
       }
     },
-    [moveRunner],
+    [moveRunner, handlePassiveRunnerEvent],
   );
+
+  // Passive (cross-terminal sync) subscription lifecycle: follow the viewed
+  // session. Re-runs on session switch (teardown + subscribe) and on page
+  // leave (teardown only, via ``setActiveView(null)`` from the page). The
+  // WS client reconnects silently on its own; when it exhausts its retries
+  // (``onClose``), recreate the runner so the subscription keeps trying.
+  useEffect(() => {
+    const sid = viewingSessionId;
+    if (!sid) return;
+    let cancelled = false;
+    // The registry Map is created once via useRef and never reassigned —
+    // capture the reference here so the cleanup (and the recreate callback)
+    // never re-reads the ref, which eslint flags as potentially stale.
+    const passiveRunners = passiveRunnersRef.current;
+    // Local handle to the current passive client so the cleanup never has
+    // to re-read the ref (which eslint flags as possibly stale).
+    let activeClient: UnifiedWSClient | null = null;
+
+    const startPassive = () => {
+      if (cancelled) return;
+      const client = new UnifiedWSClient(
+        (event) => handleRunnerEvent(sid, event),
+        () => {
+          if (cancelled) return;
+          passiveRunners.delete(sid);
+          retryTimersRef.current.add(
+            setTimeout(startPassive, PASSIVE_RECONNECT_DELAY_MS),
+          );
+        },
+      );
+      client.setPassiveSubscription(sid);
+      passiveRunners.set(sid, { key: sid, client });
+      activeClient = client;
+      client.connect();
+    };
+
+    startPassive();
+    return () => {
+      cancelled = true;
+      activeClient?.disconnect();
+      // The registry entry is owned by this effect run (created here, only
+      // removed by the ``onClose`` callback above) — drop it on teardown.
+      passiveRunners.delete(sid);
+    };
+  }, [viewingSessionId, handleRunnerEvent]);
 
   const ensureRunner = useCallback(
     (key: string) => {
@@ -1972,6 +2120,7 @@ export function UnifiedChatProvider({
       loadSession,
       showCachedSession,
       selectedSessionId: derivedState.sessionId,
+      setActiveView: setViewingSessionId,
       sessionStatuses,
       sidebarRefreshToken: state.sidebarRefreshToken,
     }),

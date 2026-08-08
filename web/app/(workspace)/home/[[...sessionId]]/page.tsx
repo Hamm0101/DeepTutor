@@ -365,6 +365,7 @@ export default function ChatPage() {
     loadSession,
     showCachedSession,
     renameSessionTitle,
+    setActiveView,
   } = useUnifiedChat();
 
   const [knowledgeBases, setKnowledgeBases] = useState<KnowledgeBase[]>([]);
@@ -1044,6 +1045,15 @@ export default function ChatPage() {
   useEffect(() => {
     setActiveSessionId(state.sessionId || sessionIdParam || null);
   }, [state.sessionId, sessionIdParam, setActiveSessionId]);
+
+  // Passive cross-terminal sync: tell the provider which session is being
+  // viewed so its session-level WS subscription follows enter / switch /
+  // leave. The cleanup fires on URL-driven session swap and on page unmount,
+  // both of which must stop watching the previous session.
+  useEffect(() => {
+    setActiveView(state.sessionId || sessionIdParam || null);
+    return () => setActiveView(null);
+  }, [state.sessionId, sessionIdParam, setActiveView]);
 
   const refreshKnowledgeBases = useCallback(
     async (options?: { force?: boolean }) => {

@@ -154,7 +154,25 @@ async def unified_websocket(ws: WebSocket) -> None:
                 if not session_id:
                     await safe_send({"type": "error", "content": "Missing session_id."})
                     continue
-                await subscribe_session(session_id, after_seq=int(msg.get("after_seq") or 0))
+                from deeptutor.services.session import get_turn_runtime_manager
+
+                runtime = get_turn_runtime_manager()
+                # Ownership guard — evaluated per message because the same
+                # socket may re-subscribe to different sessions at will.
+                # ``get_session`` is user-scoped in the multi-user PocketBase
+                # store (returns None when the session belongs to another
+                # user); the single-user SQLite fallback only checks
+                # existence. With AUTH_ENABLED=false the current user
+                # resolves to the local admin, so local mode passes naturally.
+                session = await runtime.store.get_session(session_id)
+                if session is None:
+                    await safe_send(
+                        {"type": "error", "content": "Session not found or not accessible."}
+                    )
+                    continue
+                await subscribe_session(
+                    session_id, after_seq=int(msg.get("after_seq") or 0)
+                )
                 continue
 
             if msg_type == "check_active_turn":

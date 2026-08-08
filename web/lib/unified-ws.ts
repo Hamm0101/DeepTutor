@@ -173,6 +173,14 @@ export class UnifiedWSClient {
   private activeTurnId: string | null = null;
   private lastSeq = 0;
 
+  /**
+   * Passive session-level subscription target (cross-terminal sync). When
+   * set, ``connect()`` sends ``subscribe_session`` instead of ``resume_from``
+   * after every (re)connect, and the client only observes the session's live
+   * events — it must never be torn down because a turn finished.
+   */
+  private passiveSessionId: string | null = null;
+
   constructor(onEvent: EventHandler, onClose?: () => void) {
     this.onEvent = onEvent;
     this.onClose = onClose;
@@ -182,6 +190,11 @@ export class UnifiedWSClient {
   setResumeState(turnId: string | null, seq: number): void {
     this.activeTurnId = turnId;
     this.lastSeq = seq;
+  }
+
+  /** Switch into/out of passive session-subscription mode. */
+  setPassiveSubscription(sessionId: string | null): void {
+    this.passiveSessionId = sessionId;
   }
 
   connect(): void {
@@ -196,7 +209,13 @@ export class UnifiedWSClient {
       this.lastReceivedAt = Date.now();
       this.startHeartbeat();
 
-      if (this.activeTurnId) {
+      if (this.passiveSessionId) {
+        this.send({
+          type: "subscribe_session",
+          session_id: this.passiveSessionId,
+          after_seq: 0,
+        });
+      } else if (this.activeTurnId) {
         this.send({
           type: "resume_from",
           turn_id: this.activeTurnId,
@@ -313,6 +332,7 @@ export class UnifiedWSClient {
   private resetResumeState(): void {
     this.activeTurnId = null;
     this.lastSeq = 0;
+    this.passiveSessionId = null;
     this.reconnectAttempt = 0;
   }
 }

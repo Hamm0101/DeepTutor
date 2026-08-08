@@ -600,6 +600,15 @@ class TurnRuntimeManager:
         self.store = store or get_session_store()
         self._lock = asyncio.Lock()
         self._executions: dict[str, _TurnExecution] = {}
+        # Long-lived session-level subscribers (passive cross-terminal sync):
+        # session_id → queues that want every live event of every turn in that
+        # session, across turns. Unlike ``_TurnExecution.subscribers`` these
+        # are NOT ended by the None sentinel when a turn finishes — an idle
+        # observer keeps waiting for the next turn's events.
+        # In-process only: the whole live-event architecture (executions,
+        # subscriber queues) is process-local, so this assumes a single
+        # backend instance (see compose.yaml — no replicas).
+        self._session_subscribers: dict[str, list[_LiveSubscriber]] = {}
         # Per-turn reply queues used by tools that pause the agentic
         # loop (e.g. ``ask_user``). Queue is created in ``_run_turn``
         # before the orchestrator is invoked and cleaned up in the
@@ -1133,11 +1142,70 @@ class TurnRuntimeManager:
         session_id: str,
         after_seq: int = 0,
     ) -> AsyncIterator[dict[str, Any]]:
-        active_turn = await self.store.get_active_turn(session_id)
-        if active_turn is None:
-            return
-        async for item in self.subscribe_turn(active_turn["id"], after_seq=after_seq):
-            yield item
+        """Long-lived session-level subscription: yield every live event of
+        every turn in ``session_id``, across turns.
+
+        Unlike ``subscribe_turn`` this does NOT terminate when a turn ends —
+        an idle observer keeps waiting for the next turn's events (passive
+        cross-terminal sync). The caller closes the async generator to
+        unsubscribe.
+
+        In-process only: the subscriber registry lives in this process, so
+        this assumes a single backend instance (see compose.yaml — no
+        replicas). ``after_seq`` is interpreted within the in-flight turn's
+        own per-turn numbering and is mainly useful for a mid-turn reconnect;
+        a client that reconnects across turns should re-subscribe with
+        ``after_seq=0`` and catch up via a full session reload (the store
+        persists events per turn, not per session).
+        """
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        subscriber = _LiveSubscriber(queue=queue)
+        async with self._lock:
+            self._session_subscribers.setdefault(session_id, []).append(subscriber)
+        try:
+            # Catch-up: replay the in-flight turn's already-published live
+            # events so a mid-turn subscriber doesn't miss the portion that
+            # preceded it. Only one active turn per session is allowed (the
+            # store rejects a second running turn), so a single candidate.
+            execution = None
+            async with self._lock:
+                for candidate in self._executions.values():
+                    if candidate.session_id == session_id:
+                        execution = candidate
+                        break
+            last_turn: str | None = None
+            last_seq = after_seq
+            if execution is not None:
+                async with self._lock:
+                    backlog = [
+                        item
+                        for item in execution.events
+                        if int(item.get("seq") or 0) > last_seq
+                    ]
+                for item in backlog:
+                    last_turn = str(item.get("turn_id") or "")
+                    last_seq = int(item.get("seq") or 0)
+                    yield item
+            while True:
+                item = await queue.get()
+                # Per-turn seq restarts at 1 on every turn, so the seq filter
+                # only applies within a single turn's numbering.
+                item_turn = str(item.get("turn_id") or "")
+                if item_turn != last_turn:
+                    last_turn = item_turn
+                    last_seq = after_seq
+                seq = int(item.get("seq") or 0)
+                if seq <= last_seq:
+                    continue
+                last_seq = seq
+                yield item
+        finally:
+            async with self._lock:
+                subs = self._session_subscribers.get(session_id)
+                if subs is not None:
+                    subs[:] = [sub for sub in subs if sub is not subscriber]
+                    if not subs:
+                        self._session_subscribers.pop(session_id, None)
 
     async def _run_turn(self, execution: _TurnExecution) -> None:
         payload = execution.payload
@@ -1888,7 +1956,18 @@ class TurnRuntimeManager:
             if current is not execution:
                 execution.events.append(payload)
             subscribers = list(current.subscribers)
+            # Session-level passive observers get every event of every turn
+            # in this session (cross-terminal sync). Looked up by the
+            # execution's session_id so the SESSION event published in
+            # ``start_turn`` (before the execution is registered) reaches
+            # them too.
+            session_subscribers = list(
+                self._session_subscribers.get(execution.session_id, [])
+            )
         for subscriber in subscribers:
+            with contextlib.suppress(asyncio.QueueFull):
+                subscriber.queue.put_nowait(payload)
+        for subscriber in session_subscribers:
             with contextlib.suppress(asyncio.QueueFull):
                 subscriber.queue.put_nowait(payload)
         return payload
