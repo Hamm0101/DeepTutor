@@ -1370,6 +1370,15 @@ export function UnifiedChatProvider({
             setTimeout(startPassive, PASSIVE_RECONNECT_DELAY_MS),
           );
         },
+        // Reconnected after a drop: the server re-sends ``subscribe_session``
+        // with after_seq=0, but turns that finished while offline are not
+        // replayed — refresh the transcript to catch up on anything missed.
+        () => {
+          if (cancelled) return;
+          loadSessionRef.current?.(sid).catch(() => {
+            /* non-fatal — local state remains usable */
+          });
+        },
       );
       client.setPassiveSubscription(sid);
       passiveRunners.set(sid, { key: sid, client });

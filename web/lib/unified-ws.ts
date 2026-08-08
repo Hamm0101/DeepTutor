@@ -181,9 +181,18 @@ export class UnifiedWSClient {
    */
   private passiveSessionId: string | null = null;
 
-  constructor(onEvent: EventHandler, onClose?: () => void) {
+  private onReconnect?: () => void;
+  /** Whether this client's socket has ever reached OPEN (detects drops). */
+  private everOpened = false;
+
+  constructor(
+    onEvent: EventHandler,
+    onClose?: () => void,
+    onReconnect?: () => void,
+  ) {
     this.onEvent = onEvent;
     this.onClose = onClose;
+    this.onReconnect = onReconnect;
   }
 
   /** Provide the current turn/seq so reconnection can resume the stream. */
@@ -208,6 +217,15 @@ export class UnifiedWSClient {
       this.reconnectAttempt = 0;
       this.lastReceivedAt = Date.now();
       this.startHeartbeat();
+
+      // Fire on a re-established connection after a drop (never on the
+      // initial open), so passive subscribers can catch up on turns that
+      // finished while offline — the server's catch-up only replays the
+      // in-flight execution, not turns that ended meanwhile.
+      if (this.everOpened) {
+        this.onReconnect?.();
+      }
+      this.everOpened = true;
 
       if (this.passiveSessionId) {
         this.send({
