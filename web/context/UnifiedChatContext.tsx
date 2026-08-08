@@ -1171,11 +1171,10 @@ export function UnifiedChatProvider({
 
   const handleRunnerEvent = useCallback(
     (runnerKey: string, event: StreamEvent) => {
-      const passiveRunner = passiveRunnersRef.current.get(runnerKey);
-      if (passiveRunner) {
-        handlePassiveRunnerEvent(runnerKey, event);
-        return;
-      }
+      // Local-turn events only — passive (session-level) events are routed
+      // straight to ``handlePassiveRunnerEvent`` by the passive runner's own
+      // callback and never pass through here (both runner kinds are keyed by
+      // the session id, so a lookup here would collide).
       const runner = runnersRef.current.get(runnerKey);
       const effectiveKey = runner?.key || runnerKey;
       if (event.type === "session") {
@@ -1321,7 +1320,7 @@ export function UnifiedChatProvider({
         });
       }
     },
-    [moveRunner, handlePassiveRunnerEvent],
+    [moveRunner],
   );
 
   // Passive (cross-terminal sync) subscription lifecycle: follow the viewed
@@ -1344,7 +1343,11 @@ export function UnifiedChatProvider({
     const startPassive = () => {
       if (cancelled) return;
       const client = new UnifiedWSClient(
-        (event) => handleRunnerEvent(sid, event),
+        // Route passive events DIRECTLY to the passive handler — routing them
+        // through ``handleRunnerEvent`` would collide with the local runner
+        // (both are keyed by the session id), hijacking the actor's own turn
+        // events into the passive branch.
+        (event) => handlePassiveRunnerEvent(sid, event),
         () => {
           if (cancelled) return;
           passiveRunners.delete(sid);
@@ -1367,7 +1370,7 @@ export function UnifiedChatProvider({
       // removed by the ``onClose`` callback above) — drop it on teardown.
       passiveRunners.delete(sid);
     };
-  }, [viewingSessionId, handleRunnerEvent]);
+  }, [viewingSessionId, handlePassiveRunnerEvent]);
 
   const ensureRunner = useCallback(
     (key: string) => {
@@ -1520,11 +1523,19 @@ export function UnifiedChatProvider({
         // Reached on a revalidate too, when the turn is live on the server but
         // not in this tab (started in another tab, or our socket dropped) —
         // that is exactly the case that still needs a subscribe.
-        sendThroughRunner(key, {
-          type: "subscribe_turn",
-          turn_id: activeTurn.turn_id || activeTurn.id,
-          after_seq: 0,
-        });
+        //
+        // Skip when this tab already holds a passive session-level
+        // subscription for the session: that subscription already streams the
+        // turn's events, and adding a per-turn subscribe here would route the
+        // remote turn through the local (actor) pipeline instead of the
+        // passive one.
+        if (!passiveRunnersRef.current.has(key)) {
+          sendThroughRunner(key, {
+            type: "subscribe_turn",
+            turn_id: activeTurn.turn_id || activeTurn.id,
+            after_seq: 0,
+          });
+        }
       }
     },
     [hydrateMessages, sendThroughRunner],
